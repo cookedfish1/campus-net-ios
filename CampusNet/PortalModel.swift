@@ -2,11 +2,15 @@ import Foundation
 import WebKit
 import Combine
 
-/// 核心流程：探测门户 → WKWebView 打开 → documentEnd 自轮询填表提交 → 轮询 204 判定
+/// 核心流程（隐藏模式）：
+///   1×1 的 WKWebView 挂在视图树里（不 isHidden，避免 WebKit 判定不可见而挂起）
+///   Swift 定时器每 250ms 注入一次「查找表单 → 填 → 提交」
+///   提交后每 800ms 探测 204
+///   成功 → 静默；失败 → 自动弹出可见门户页供人工处理（验证码 / 异常）
 ///
-/// 速度优化：不等 didFinish（它等于 window.onload，会被门户页的大图拖到 20 秒），
-/// 改为在 documentEnd 注入一段自轮询脚本，一出现输入框就填并提交；同时用内容拦截器屏蔽图片。
-final class PortalModel: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler {
+/// 为什么不用 JS 的 setInterval：非可见 webview 里定时器会被节流到 ≥1 秒甚至暂停，
+/// 由 App 侧驱动才稳定。
+final class PortalModel: NSObject, ObservableObject {
     @Published var status = "未检测"
     @Published var busy = false
     @Published var showWeb = false
@@ -18,27 +22,30 @@ final class PortalModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
     let sessionStore = SessionStore()
     let provider: PortalProvider = RenAiProvider()
 
-    private var webView: WKWebView?
-    private var pendingURL: URL?
+    let logoutClient = LogoutClient()
+
+    /// 自动化用的隐藏 webview（常驻）
+    private var hiddenWV: WKWebView?
+    /// 兜底用的可见 webview（需要人工时创建）
+    private var visibleWV: WKWebView?
+    private var portalURL: URL?
     private var user = ""
     private var password = ""
 
-    private enum Phase { case idle, loading, submitted, finished }
-    private var phase: Phase = .idle
+    private var injectTimer: Timer?
+    private var injectTries = 0
     private var pollTimer: Timer?
     private var pollTicks = 0
 
     private static var ruleList: WKContentRuleList?
     private static var ruleListTried = false
 
-    private let logoutClient = LogoutClient()
-
     override init() {
         super.init()
         compileRuleListIfNeeded()
     }
 
-    // MARK: - 内容拦截：屏蔽图片
+    // MARK: - 构建 webview
 
     private func compileRuleListIfNeeded() {
         guard !Self.ruleListTried else { return }
@@ -52,92 +59,32 @@ final class PortalModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         }
     }
 
-    // MARK: - WebView
-
     private func makeWebView() -> WKWebView {
         let cfg = WKWebViewConfiguration()
+        cfg.websiteDataStore = .nonPersistent()
         let ucc = WKUserContentController()
-        ucc.add(self, name: "cnlog")
-        ucc.addUserScript(WKUserScript(source: autoFillJS(),
-                                       injectionTime: .atDocumentEnd,
-                                       forMainFrameOnly: false))
         if let list = Self.ruleList { ucc.add(list) }
         cfg.userContentController = ucc
-        cfg.websiteDataStore = .nonPersistent()
-
-        let wv = WKWebView(frame: .zero, configuration: cfg)
+        cfg.allowsInlineMediaPlayback = true
+        let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: 1, height: 1), configuration: cfg)
         wv.navigationDelegate = self
+        wv.isUserInteractionEnabled = false
         return wv
     }
 
-    func ensureWebView() -> WKWebView {
-        if let wv = webView { return wv }
+    func ensureHiddenWebView() -> WKWebView {
+        if let wv = hiddenWV { return wv }
         let wv = makeWebView()
-        webView = wv
+        hiddenWV = wv
         return wv
     }
 
-    private func recreateWebView() {
-        webView?.stopLoading()
-        webView?.removeFromSuperview()
-        webView = makeWebView()
-    }
-
-    private func autoFillJS() -> String {
-        """
-        (function(){
-          if (window.__cnRunning) { return; }
-          window.__cnRunning = true;
-          var tries = 0;
-          var timer = setInterval(function(){
-            tries++;
-            var u = document.querySelector('\(provider.userSelectors)');
-            var p = document.querySelector('\(provider.passwordSelectors)');
-            if (u && p) {
-              clearInterval(timer);
-              window.__cnRunning = false;
-              u.value = \(Self.jsLiteral(user));
-              p.value = \(Self.jsLiteral(password));
-              var f = u.form || document.querySelector('\(provider.formSelectors)');
-              if (!f) {
-                window.webkit.messageHandlers.cnlog.postMessage('noform-element');
-                return;
-              }
-              window.webkit.messageHandlers.cnlog.postMessage('submitted');
-              try { f.submit(); } catch(e) {
-                window.webkit.messageHandlers.cnlog.postMessage('submit-error|' + e);
-              }
-              return;
-            }
-            if (tries > 100) {
-              clearInterval(timer);
-              window.__cnRunning = false;
-              var ids = [];
-              document.querySelectorAll('input').forEach(function(e){
-                ids.push((e.id || '') + '/' + (e.name || '') + '/' + (e.type || ''));
-              });
-              window.webkit.messageHandlers.cnlog.postMessage(
-                'noform|url=' + location.href + '|inputs=' + ids.join(','));
-            }
-          }, 150);
-        })();
-        """
-    }
-
-    private func load(portal: URL) {
-        pendingURL = portal
-        phase = .loading
-        pollTicks = 0
-        log.log("加载门户：\(portal.absoluteString)")
-        var req = URLRequest(url: portal)
-        req.timeoutInterval = 30
-        ensureWebView().load(req)
-    }
-
-    /// 供弹层出现后调用
-    func attached() {
-        guard webView?.url == nil, let url = pendingURL else { return }
-        load(portal: url)
+    func ensureVisibleWebView() -> WKWebView {
+        if let wv = visibleWV { return wv }
+        let wv = makeWebView()
+        wv.isUserInteractionEnabled = true
+        visibleWV = wv
+        return wv
     }
 
     // MARK: - 上线
@@ -147,9 +94,8 @@ final class PortalModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         self.user = user.trimmingCharacters(in: .whitespacesAndNewlines)
         self.password = password
         busy = true
-        phase = .idle
         status = "检测网络…"
-        log.log("=== 开始上线 ===")
+        log.log("=== 开始上线（隐藏模式）===")
 
         Task {
             do {
@@ -165,10 +111,10 @@ final class PortalModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
                 }
                 self.log.log("未认证 → IP=\(p.userIP)  AC=\(p.acName)  SSID=\(p.ssid)")
                 DispatchQueue.main.async {
-                    self.recreateWebView()
-                    self.status = "打开门户…"
-                    self.showWeb = true
-                    self.pendingURL = p.pageURL
+                    self.portalURL = p.pageURL
+                    self.status = "登录中…"
+                    self.loadInHidden(p.pageURL)
+                    self.startInjecting()
                 }
             } catch {
                 self.log.log("探测失败：\(error.localizedDescription)")
@@ -188,24 +134,83 @@ final class PortalModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         }
     }
 
-    // MARK: - 脚本消息
-
-    func userContentController(_ userContentController: WKUserContentController,
-                               didReceive message: WKScriptMessage) {
-        guard message.name == "cnlog", let body = message.body as? String else { return }
-        DispatchQueue.main.async { self.handleScript(body) }
+    private func loadInHidden(_ url: URL) {
+        let wv = ensureHiddenWebView()
+        wv.load(URLRequest(url: url, timeoutInterval: 30))
+        log.log("加载门户（隐藏）：\(url.absoluteString)")
     }
 
-    private func handleScript(_ s: String) {
-        log.log("页面脚本：\(s)")
-        if s == "submitted" {
-            phase = .submitted
-            startPolling()
-        } else if s.hasPrefix("noform") {
-            finishFail("页面里找不到登录表单")
-        } else if s.hasPrefix("submit-error") {
-            finishFail("表单提交出错")
+    // MARK: - 注入（Swift 驱动）
+
+    private func startInjecting() {
+        injectTimer?.invalidate()
+        injectTries = 0
+        injectTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            self.injectTries += 1
+            if self.injectTries > 80 {          // 20 秒
+                timer.invalidate()
+                self.fallbackToManual("页面里找不到登录表单")
+                return
+            }
+            self.tryFill()
         }
+    }
+
+    private func tryFill() {
+        guard let wv = hiddenWV else { return }
+        wv.evaluateJavaScript(fillJS) { [weak self] result, error in
+            guard let self else { return }
+            if let error = error {
+                if self.injectTries % 8 == 0 {
+                    self.log.log("注入异常：\(error.localizedDescription)")
+                }
+                return
+            }
+            let r = (result as? String) ?? ""
+            if r.hasPrefix("submitted") {
+                self.injectTimer?.invalidate()
+                self.injectTimer = nil
+                self.log.log("已提交：\(r)")
+                self.startPolling()
+            } else if self.injectTries % 8 == 0 {
+                self.log.log("等待表单… \(r)")
+            }
+        }
+    }
+
+    private var fillJS: String {
+        """
+        (function(){
+          if (window.__cnSubmitted) { return 'submitted|already'; }
+          function collect(doc){
+            var out=[];
+            doc.querySelectorAll('input').forEach(function(e){ out.push((e.id||'')+'/'+(e.name||'')); });
+            return out.join(',');
+          }
+          function find(doc, depth){
+            if (depth > 3) { return null; }
+            if (doc.querySelector('\(provider.userSelectors)')) { return doc; }
+            var fr = doc.querySelectorAll('iframe,frame');
+            for (var i=0;i<fr.length;i++){
+              try { var d = fr[i].contentDocument; if (d) { var r = find(d, depth+1); if (r) { return r; } } } catch(e) {}
+            }
+            return null;
+          }
+          var d = find(document, 0);
+          if (!d) { return 'noform|' + location.href + '|' + collect(document); }
+          var u = d.querySelector('\(provider.userSelectors)');
+          var p = d.querySelector('\(provider.passwordSelectors)');
+          if (!u || !p) { return 'partial|' + location.href + '|' + collect(d); }
+          u.value = \(Self.jsLiteral(user));
+          p.value = \(Self.jsLiteral(password));
+          var f = u.form || d.querySelector('\(provider.formSelectors)');
+          if (!f) { return 'noform-element'; }
+          window.__cnSubmitted = true;
+          try { f.submit(); } catch(e) { return 'submit-error|' + e; }
+          return 'submitted|' + (f.action || '');
+        })();
+        """
     }
 
     // MARK: - 判定
@@ -213,7 +218,6 @@ final class PortalModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
     private func startPolling() {
         pollTimer?.invalidate()
         pollTicks = 0
-        log.log("已提交，轮询放行状态…")
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] timer in
             guard let self else { timer.invalidate(); return }
             self.pollTicks += 1
@@ -227,22 +231,10 @@ final class PortalModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
                 } else if self.pollTicks >= 25 {
                     DispatchQueue.main.async {
                         timer.invalidate()
-                        self.dumpPageAfterFailure()
+                        self.fallbackToManual("提交后 20 秒仍未被放行")
                     }
                 }
             }
-        }
-    }
-
-    private func dumpPageAfterFailure() {
-        guard let wv = webView else { finishFail("等待 20 秒仍未被放行"); return }
-        wv.evaluateJavaScript("document.documentElement.outerHTML") { result, _ in
-            let html = (result as? String) ?? ""
-            self.log.log("失败页长度：\(html.count)")
-            if let a = Self.extractAlert(html) { self.log.log("服务器提示：\(a)") }
-            let plain = Self.plainText(html)
-            if !plain.isEmpty { self.log.log("失败页文本：\(String(plain.prefix(300)))") }
-            self.finishFail("等待 20 秒仍未被放行")
         }
     }
 
@@ -251,23 +243,38 @@ final class PortalModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         status = "已登录"
         isOnline = true
         busy = false
-        phase = .finished
         showWeb = false
         captureSession()
+        if let wv = hiddenWV {
+            wv.loadHTMLString("<html><body></body></html>", baseURL: nil)
+        }
     }
 
-    private func finishFail(_ reason: String) {
-        log.log("✗ 登录失败：\(reason)")
-        status = "失败：\(reason)"
+    // MARK: - 兜底：转人工
+
+    private func fallbackToManual(_ reason: String) {
+        log.log("转为人工处理：\(reason)")
+        status = "需要手动处理：\(reason)"
         isOnline = false
         busy = false
-        phase = .finished
+        injectTimer?.invalidate()
+        injectTimer = nil
+        pollTimer?.invalidate()
+        pollTimer = nil
+
+        if let url = portalURL {
+            visibleWV = nil            // 用干净的实例，避免和隐藏实例抢同一个 webview
+            let wv = ensureVisibleWebView()
+            wv.load(URLRequest(url: url, timeoutInterval: 30))
+            log.log("已打开可见门户：\(url.absoluteString)")
+        }
+        showWeb = true
     }
 
-    // MARK: - 保存会话（下线要用）
+    // MARK: - 保存会话
 
     private func captureSession() {
-        guard let wv = webView else { return }
+        guard let wv = hiddenWV else { return }
         let js = """
         (function(){
           var f = document.getElementById('formLogout');
@@ -311,10 +318,9 @@ final class PortalModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
             }
             do {
                 try await logoutClient.logout(using: saved, urlString: provider.logoutURL)
-                // 轮询确认真的掉线
                 for _ in 0..<10 {
                     try? await Task.sleep(nanoseconds: 600_000_000)
-                    let online = await client.isOnline()
+                    let online = await self.client.isOnline()
                     if !online {
                         self.log.log("✓ 已下线（探针回到门户）")
                         DispatchQueue.main.async {
@@ -380,27 +386,11 @@ final class PortalModel: NSObject, ObservableObject, WKNavigationDelegate, WKScr
         }
         return out + "\""
     }
-
-    private static func extractAlert(_ html: String) -> String? {
-        guard let re = try? NSRegularExpression(pattern: "alert\\(\"([^\"]*)\"\\)") else { return nil }
-        let ns = html as NSString
-        guard let m = re.firstMatch(in: html, range: NSRange(location: 0, length: ns.length)),
-              m.numberOfRanges > 1 else { return nil }
-        return ns.substring(with: m.range(at: 1))
-    }
-
-    private static func plainText(_ html: String) -> String {
-        let noScript = html.replacingOccurrences(of: "<script[\\s\\S]*?</script>", with: " ",
-                                                 options: .regularExpression)
-        let noTags = noScript.replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
-        let collapsed = noTags.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-        return collapsed.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
 }
 
 // MARK: - WKNavigationDelegate
 
-extension PortalModel {
+extension PortalModel: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         log.log("加载完成：\(webView.url?.absoluteString ?? "?")")
     }

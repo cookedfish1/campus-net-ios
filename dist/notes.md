@@ -1,13 +1,13 @@
-修复真机反馈的「不能自动填充账密」。
+真机日志显示：登录链路本身是通的，19 秒全耗在等门户页的 banner 图片（`didFinish` 等同 `window.onload`）。
 
-日志显示注入返回 `noform` —— 页面上没有 `#Wp_user`，说明 iOS 拿到的页面结构与桌面版不同（移动版或 frameset）。
+**提速**
+- 不再依赖 `didFinish`，改为 `atDocumentEnd` 注入自轮询脚本，一出现输入框立即填表提交
+- 内容拦截器屏蔽图片
+- 放行判定轮询 2s → 0.8s
 
-本次改动：
-- 递归向下 3 层查找同源子 frame，兼容 frameset
-- 字段候选扩展：`Wp_user` / `userName` / `username`；`Wp_password` / `userPwd` / `pwd` / `password`
-- 找不到表单时，把 URL、标题、frame 数、**所有 input 的 id/name/type** 写进日志
-- 提交后不再依赖顶层 `didFinish`（iframe 内提交不触发），改为每 2 秒轮询 204
-- 失败时追加服务器 alert 与页面正文前 300 字
+**补全**
+- 「已上线」开关：下线复用登录时保存的会话（cookie + `#formLogout` 字段）
+- 5G / 2.4G 切换（`NEHotspotConfigurationManager`，需 Hotspot Configuration 能力）
+- `PortalProvider` 协议，TJRAC 占位
 
-仍未验证 WKWebView 是否被 WAF 拦截——如果这次日志里出现 `HTTP 500` 或异常文
-本，那就是同一个客户端指纹问题，需要换思路。
+预期登录耗时从约 22 秒降到 3~5 秒。

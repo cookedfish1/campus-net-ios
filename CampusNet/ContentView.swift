@@ -76,7 +76,6 @@ struct ContentView: View {
             .navigationTitle("校园网")
             .onAppear { model.log.ensureFile() }
             .onChange(of: model.busy) { busy in
-                // 动作结束后同步开关：登录失败时自动弹回
                 if !busy { wantOnline = model.isOnline }
             }
             .onChange(of: model.isOnline) { online in
@@ -86,14 +85,40 @@ struct ContentView: View {
                 PortalSheet(model: model)
             }
         }
+        // 隐藏宿主：1×1、透明度 0.01、不可交互。
+        // 必须留在视图树里——WKWebView 没有 window 就不会加载；
+        // 也不能用 isHidden，WebKit 会判定不可见而节流。
+        .background(alignment: .topLeading) {
+            HiddenHost(model: model)
+                .frame(width: 1, height: 1)
+                .allowsHitTesting(false)
+        }
     }
 }
 
-/// 承载 WKWebView 的弹层。登录过程中门户页面可见，出验证码也能手填。
+struct HiddenHost: UIViewRepresentable {
+    let model: PortalModel
+
+    func makeUIView(context: Context) -> UIView {
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+        container.isUserInteractionEnabled = false
+        container.alpha = 0.01
+        container.clipsToBounds = true
+
+        let wv = model.ensureHiddenWebView()
+        wv.frame = container.bounds
+        wv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        container.addSubview(wv)
+        return container
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
+
+/// 兜底用的可见门户页（自动化失败时才弹出）
 struct PortalSheet: View {
     @ObservedObject var model: PortalModel
     @Environment(\.dismiss) private var dismiss
-    @State private var didAttach = false
 
     var body: some View {
         NavigationStack {
@@ -106,12 +131,6 @@ struct PortalSheet: View {
                         Button("关闭") { dismiss() }
                     }
                 }
-                .onAppear {
-                    if !didAttach {
-                        didAttach = true
-                        DispatchQueue.main.async { model.attached() }
-                    }
-                }
         }
     }
 }
@@ -120,7 +139,7 @@ struct WebContainer: UIViewRepresentable {
     let model: PortalModel
 
     func makeUIView(context: Context) -> WKWebView {
-        model.ensureWebView()
+        model.ensureVisibleWebView()
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
