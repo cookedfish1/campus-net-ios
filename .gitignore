@@ -1,4 +1,4 @@
-# macOS
+﻿# macOS
 .DS_Store
 
 # Xcode
@@ -15,3 +15,4 @@ Payload/
 
 # 本地配置
 *.local.xcconfig
+dist/
