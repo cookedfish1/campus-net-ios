@@ -5,6 +5,9 @@ struct ContentView: View {
     @StateObject private var model = PortalModel()
     @AppStorage("cn.user") private var user: String = ""
     @State private var password: String = ""
+    @State private var wantOnline = false
+
+    private var canOperate: Bool { !model.busy && !user.isEmpty && !password.isEmpty }
 
     var body: some View {
         NavigationStack {
@@ -17,21 +20,36 @@ struct ContentView: View {
                     SecureField("密码", text: $password)
                 }
 
-                Section("操作") {
-                    Button {
-                        model.startLogin(user: user, password: password)
-                    } label: {
-                        HStack {
-                            Text(model.busy ? "处理中…" : "上线（自动登录）")
-                            Spacer()
-                            if model.busy { ProgressView() }
-                        }
+                Section("网络") {
+                    HStack(spacing: 12) {
+                        Button("5G") { model.join(ssid: "CMCC_RenAi_5G") }
+                            .buttonStyle(.bordered)
+                            .disabled(model.busy)
+                        Button("2.4G") { model.join(ssid: "CMCC_RenAi_2.4G") }
+                            .buttonStyle(.bordered)
+                            .disabled(model.busy)
+                        Spacer()
                     }
-                    .disabled(model.busy || user.isEmpty || password.isEmpty)
+                    if !model.hotspotStatus.isEmpty {
+                        Text(model.hotspotStatus)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
 
-                    Text(model.status)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                Section("状态") {
+                    Toggle("已上线", isOn: $wantOnline)
+                        .disabled(!canOperate)
+                        .onChange(of: wantOnline) { value in
+                            model.setOnline(value, user: user, password: password)
+                        }
+                    HStack {
+                        Text(model.status)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        if model.busy { ProgressView() }
+                    }
                 }
 
                 Section("日志") {
@@ -57,6 +75,13 @@ struct ContentView: View {
             }
             .navigationTitle("校园网")
             .onAppear { model.log.ensureFile() }
+            .onChange(of: model.busy) { busy in
+                // 动作结束后同步开关：登录失败时自动弹回
+                if !busy { wantOnline = model.isOnline }
+            }
+            .onChange(of: model.isOnline) { online in
+                if !model.busy { wantOnline = online }
+            }
             .sheet(isPresented: $model.showWeb) {
                 PortalSheet(model: model)
             }
@@ -64,9 +89,9 @@ struct ContentView: View {
     }
 }
 
-/// 承载 WKWebView 的弹层。登录过程中可见——出验证码时也能手动填。
+/// 承载 WKWebView 的弹层。登录过程中门户页面可见，出验证码也能手填。
 struct PortalSheet: View {
-    let model: PortalModel
+    @ObservedObject var model: PortalModel
     @Environment(\.dismiss) private var dismiss
     @State private var didAttach = false
 
