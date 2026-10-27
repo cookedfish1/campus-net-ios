@@ -1,0 +1,37 @@
+name: CampusNet
+options:
+  bundleIdPrefix: com.cookedfish1
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+
+targets:
+  CampusNet:
+    type: application
+    platform: iOS
+    sources:
+      - path: CampusNet
+        excludes:
+          - "Info.plist"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cookedfish1.campusnet
+        PRODUCT_NAME: CampusNet
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
+    info:
+      path: CampusNet/Info.plist
+      properties:
+        CFBundleDisplayName: 校园网
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait

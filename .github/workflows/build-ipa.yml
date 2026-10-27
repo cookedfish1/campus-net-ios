@@ -1,0 +1,53 @@
+name: build-ipa
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project CampusNet.xcodeproj \
+            -target CampusNet \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/CampusNet.app Payload/
+          zip -qry CampusNet-unsigned.ipa Payload
+          ls -lh CampusNet-unsigned.ipa
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" Payload/CampusNet.app/Info.plist || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CampusNet-unsigned-ipa
+          path: CampusNet-unsigned.ipa
+          if-no-files-found: error
